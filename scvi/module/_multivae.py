@@ -1,4 +1,4 @@
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Callable
 
 import numpy as np
 import torch
@@ -19,6 +19,134 @@ from scvi.module.base import BaseModuleClass, LossRecorder, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, one_hot
 
 from ._utils import masked_softmax
+
+
+# Encoder
+def _identity(x):
+    return x
+
+
+class EncoderMulti(nn.Module):
+    """
+    Encode data of ``n_input`` dimensions into a latent space of ``n_output`` dimensions.
+
+    Uses a fully-connected neural network of ``n_hidden`` layers.
+
+    Parameters
+    ----------
+    n_input
+        The dimensionality of the input (data space)
+    n_output
+        The dimensionality of the output (latent space)
+    n_cat_list
+        A list containing the number of categories
+        for each category of interest. Each category will be
+        included using a one-hot encoding
+    n_layers
+        The number of fully-connected hidden layers
+    n_hidden
+        The number of nodes per hidden layer
+    dropout_rate
+        Dropout rate to apply to each of the hidden layers
+    distribution
+        Distribution of z
+    var_eps
+        Minimum value for the variance;
+        used for numerical stability
+    var_activation
+        Callable used to ensure positivity of the variance.
+        Defaults to :meth:`torch.exp`.
+    return_dist
+        Return directly the distribution of z instead of its parameters.
+    **kwargs
+        Keyword args for :class:`~scvi.nn.FCLayers`
+    """
+
+    def __init__(
+        self,
+        n_input_a: int,
+        n_input_r: int,
+        n_output: int,
+        n_cat_list: Iterable[int] = None,
+        n_layers: int = 1,
+        n_hidden: int = 128,
+        dropout_rate: float = 0.1,
+        distribution: str = "normal",
+        var_eps: float = 1e-4,
+        var_activation: Optional[Callable] = None,
+        return_dist: bool = False,
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.distribution = distribution
+        self.var_eps = var_eps
+        self.encoder_a = FCLayers(
+            n_in=n_input_a,
+            n_out=n_hidden,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+            **kwargs,
+        )
+        self.encoder_r = FCLayers(
+            n_in=n_input_r,
+            n_out=n_hidden,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+            **kwargs,
+        )
+
+        self.mean_encoder = nn.Linear(n_hidden, n_output)
+        self.var_encoder = nn.Linear(n_hidden, n_output)
+        self.return_dist = return_dist
+
+        if distribution == "ln":
+            self.z_transformation = nn.Softmax(dim=-1)
+        else:
+            self.z_transformation = _identity
+        self.var_activation = torch.exp if var_activation is None else var_activation
+
+    def forward(self, x_r: torch.Tensor, x_a: torch.Tensor, *cat_list: int):
+        r"""
+        The forward computation for a single sample.
+
+         #. Encodes the data into latent space using the encoder network
+         #. Generates a mean \\( q_m \\) and variance \\( q_v \\)
+         #. Samples a new value from an i.i.d. multivariate normal \\( \\sim Ne(q_m, \\mathbf{I}q_v) \\)
+
+        Parameters
+        ----------
+        x
+            tensor with shape (n_input,)
+        cat_list
+            list of category membership(s) for this sample
+
+        Returns
+        -------
+        3-tuple of :py:class:`torch.Tensor`
+            tensors of shape ``(n_latent,)`` for mean and var, and sample
+
+        """
+        # Parameters for latent distribution
+        q_r = self.encoder_r(x_r, *cat_list)
+        q_rm = self.mean_encoder(q_r)
+        q_rv = self.var_activation(self.var_encoder(q_r)) + self.var_eps
+        dist_r = Normal(q_rm, q_rv.sqrt())
+        latent_r = self.z_transformation(dist_r.rsample())
+
+        q_a = self.encoder_a(x_a, *cat_list)
+        q_am = self.mean_encoder(q_a)
+        q_av = self.var_activation(self.var_encoder(q_a)) + self.var_eps
+        dist_a = Normal(q_am, q_av.sqrt())
+        latent_a = self.z_transformation(dist_a.rsample())
+
+        if self.return_dist:
+            return dist_r, latent_r, dist_a, latent_a
+        return q_rm, q_rv, latent_r, q_am, q_av, latent_a
 
 
 class LibrarySizeEncoder(torch.nn.Module):
@@ -357,12 +485,19 @@ class MULTIVAE(BaseModuleClass):
         else:
             input_exp = self.n_input_genes
         n_input_encoder_exp = input_exp + n_continuous_cov * encode_covariates
-        self.z_encoder_expression = Encoder(
-            n_input=n_input_encoder_exp,
+        if self.n_input_regions == 0:
+            input_acc = 1
+        else:
+            input_acc = self.n_input_regions
+        n_input_encoder_acc = input_acc + n_continuous_cov * encode_covariates
+
+        self.z_encoder = EncoderMulti(
+            n_input_r=n_input_encoder_exp,
+            n_input_a=n_input_encoder_acc,
             n_output=self.n_latent,
             n_cat_list=encoder_cat_list,
             n_layers=self.n_layers_encoder,
-            n_hidden=self.n_hidden,
+            n_hidden=128,
             dropout_rate=self.dropout_rate,
             distribution=self.latent_distribution,
             inject_covariates=deeply_inject_covariates,
@@ -399,27 +534,6 @@ class MULTIVAE(BaseModuleClass):
         )
 
         # accessibility
-        # accessibility encoder
-        if self.n_input_regions == 0:
-            input_acc = 1
-        else:
-            input_acc = self.n_input_regions
-        n_input_encoder_acc = input_acc + n_continuous_cov * encode_covariates
-        self.z_encoder_accessibility = Encoder(
-            n_input=n_input_encoder_acc,
-            n_layers=self.n_layers_encoder,
-            n_output=self.n_latent,
-            n_hidden=self.n_hidden,
-            n_cat_list=encoder_cat_list,
-            dropout_rate=self.dropout_rate,
-            activation_fn=torch.nn.LeakyReLU,
-            distribution=self.latent_distribution,
-            var_eps=0,
-            use_batch_norm=self.use_batch_norm_encoder,
-            use_layer_norm=self.use_layer_norm_encoder,
-            return_dist=False,
-        )
-
         # accessibility region-specific factors
         self.region_factors = None
         if region_factors:
@@ -587,8 +701,8 @@ class MULTIVAE(BaseModuleClass):
             x_chr = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
         else:
             x_chr = x[
-                :, self.n_input_genes : (self.n_input_genes + self.n_input_regions)
-            ]
+                    :, self.n_input_genes: (self.n_input_genes + self.n_input_regions)
+                    ]
 
         mask_expr = x_rna.sum(dim=1) > 0
         mask_acc = x_chr.sum(dim=1) > 0
@@ -609,12 +723,11 @@ class MULTIVAE(BaseModuleClass):
             categorical_input = tuple()
 
         # Z Encoders
-        qzm_acc, qzv_acc, z_acc = self.z_encoder_accessibility(
-            encoder_input_accessibility, batch_index, *categorical_input
-        )
-        qzm_expr, qzv_expr, z_expr = self.z_encoder_expression(
-            encoder_input_expression, batch_index, *categorical_input
-        )
+        qzm_expr, qzv_expr, z_expr, qzm_acc, qzv_acc, z_acc = self.z_encoder(encoder_input_expression,
+                                                                             encoder_input_accessibility,
+                                                                             batch_index, *categorical_input
+                                                                             )
+
         qzm_pro, qzv_pro, z_pro = self.z_encoder_protein(
             encoder_input_protein, batch_index, *categorical_input
         )
@@ -645,15 +758,14 @@ class MULTIVAE(BaseModuleClass):
 
         # sample
         if n_samples > 1:
-
             def unsqz(zt, n_s):
                 return zt.unsqueeze(0).expand((n_s, zt.size(0), zt.size(1)))
 
             untran_za = Normal(qzm_acc, qzv_acc.sqrt()).sample((n_samples,))
-            z_acc = self.z_encoder_accessibility.z_transformation(untran_za)
             untran_ze = Normal(qzm_expr, qzv_expr.sqrt()).sample((n_samples,))
-            z_expr = self.z_encoder_expression.z_transformation(untran_ze)
             untran_zp = Normal(qzm_pro, qzv_pro.sqrt()).sample((n_samples,))
+            z_acc = self.z_encoder.z_transformation(untran_za)
+            z_expr = self.z_encoder.z_transformation(untran_ze)
             z_pro = self.z_encoder_protein.z_transformation(untran_zp)
 
             libsize_expr = unsqz(libsize_expr, n_samples)
@@ -661,7 +773,7 @@ class MULTIVAE(BaseModuleClass):
 
         # sample from the mixed representation
         untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
-        z = self.z_encoder_accessibility.z_transformation(untran_z)
+        z = self.z_encoder.z_transformation(untran_z)
 
         outputs = dict(
             z=z,
@@ -806,7 +918,7 @@ class MULTIVAE(BaseModuleClass):
 
         # TODO: CHECK IF THIS FAILS IN ONLY RNA DATA
         x_rna = x[:, : self.n_input_genes]
-        x_chr = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_regions)]
+        x_chr = x[:, self.n_input_genes: (self.n_input_genes + self.n_input_regions)]
         if self.n_input_proteins == 0:
             y = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
         else:
@@ -874,7 +986,7 @@ class MULTIVAE(BaseModuleClass):
 
         kl_local = dict(kl_divergence_z=kl_div_z)
         kl_global = torch.tensor(0.0)
-        return LossRecorder(loss, recon_loss, kl_local, kl_global, kld_paired=kld_paired)
+        return LossRecorder(loss, recon_loss, kl_local, kl_global, kld_paired=torch.mean(kld_paired))
 
     def get_reconstruction_loss_expression(self, x, px_rate, px_r, px_dropout):
         """Computes the reconstruction loss for the expression data."""
@@ -884,8 +996,8 @@ class MULTIVAE(BaseModuleClass):
                 -ZeroInflatedNegativeBinomial(
                     mu=px_rate, theta=px_r, zi_logits=px_dropout
                 )
-                .log_prob(x)
-                .sum(dim=-1)
+                    .log_prob(x)
+                    .sum(dim=-1)
             )
         elif self.gene_likelihood == "nb":
             rl = -NegativeBinomial(mu=px_rate, theta=px_r).log_prob(x).sum(dim=-1)
@@ -988,7 +1100,7 @@ class MULTIVAE(BaseModuleClass):
 
 
 @auto_move_data
-def mix_modalities(Xs, masks, weights, weight_transform: callable = None):
+def mix_modalities(Xs, masks, weights, weight_transform: Callable = None):
     """
     Compute the weighted mean of the Xs while masking unmeasured modality values.
 
